@@ -1,0 +1,15 @@
+#!/bin/bash
+##
+# Wrapper to start up the stargate application within virtual env
+#
+
+BASE=/usr/local/stargate
+
+## Clean up .pyc files
+# Doesn't work if you are using a virtual env and other dir you dont want to
+# clear out.
+#find $BASE -name "*.pyc" | xargs rm
+
+cd $BASE
+source $BASE/env/bin/activate
+twistd -l $BASE/logs/stargate.log --pidfile $BASE/stargate.pid -y stargate.tac

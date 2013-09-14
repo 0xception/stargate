@@ -1,0 +1,35 @@
+#!/bin/sh
+#
+# Stargate start/stop script.
+# Description: Ovation Networks Inc. asterisk integration service.
+
+NAME=stargate
+BASE=/usr/local/$NAME
+DAEMON=$BASE/$NAME
+PID=$DAEMON.pid
+DESC="$NAME daemon"
+
+test -f $DAEMON || exit 0
+
+case "$1" in
+  start)
+        echo "Starting $DESC"
+        start-stop-daemon --start --oknodo --pidfile $PID --exec $DAEMON
+        ;;
+  stop)
+        echo "Stopping $DESC"
+        start-stop-daemon --stop --quiet --pidfile $PID --retry=TERM/10/KILL/5 && return 0
+        start-stop-daemon --stop --oknodo --exec $DAEMON --name $NAME --retry=TERM/10/KILL/5
+        ;;
+  restart|force-reload)
+        $0 stop
+        $0 start
+        ;;
+  *)
+        N=/etc/init.d/$NAME
+        echo "Usage: $N {start|stop|restart|force-reload}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,410 @@
+"""
+Stargate call data records plugin designed to allow more useful call record
+tracking and accounting.
+
+Copyright (C) 2010 Ovation Networks, Inc.
+This file is part of Stargate.
+
+Stargate is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Stargate is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Foobar.  If not, see <http://www.gnu.org/licenses/>.
+"""
+##!/usr/bin/env python
+
+from zope.interface import implements
+from twisted.plugin import IPlugin
+from twisted.internet import defer
+from twisted.python import log
+from twisted.application import internet
+from starpy import fastagi
+
+from stargate import IChevron
+import config
+
+#def verbose(fn):
+#    def wrapper():
+#        debug("%s Chevron: %s Event Triggered: %s" %
+#            (self.__class__.__name__, event['event'], event,))
+#         fn()
+#    return wrapper()
+
+#def event(fn):
+#    def wrapper(*args, **kwargs):
+#        debug("%s Chevron: %s args and %s keyword args" %
+#            (fn.__name__, args, kwargs))
+#        return fn()
+#    return wrapper()
+
+
+def debug(*args, **kwargs):
+    """ If debug mode is set push out logs """
+    d = False
+    if d:
+        log.msg(*args, **kwargs)
+
+
+#@defer.inlineCallbacks
+class RequestHandler:
+    """ Handles requests to control the callback queue """
+    maxErrs = 3
+
+    def __init__(self, dbpool):
+        self.dbpool = dbpool
+        self.uid = 0
+        self.errCount = 0
+        self.deferred = defer.Deferred()
+
+    def _fail(self, failure):
+        """
+        Attempt to retry our collector calls up to a maximum
+        failed attempts (default 3). If still unsuccessful
+        return failed deferred object
+        """
+        self.errCount += 1
+        if self.errCount < self.maxErrs:
+            pass
+        else:
+            self.deferred.errback(failure)
+
+    def getActiveRecords(self):
+        return self.dbpool.runQuery("""
+            SELECT `uid` FROM `records` WHERE call_end = '0000-00-00 00:00:00'
+        """)
+
+    def createRecord(self, uid, channel, callerNumber, callerName,
+                    callerDNID, accountCode, status):
+        """
+        Creates new record in the stargate database.
+        """
+        if uid > 0:
+            debug("Creating a new Call Record: %s, %s, %s, %s, %s, %s, %s" %
+                (uid, channel, callerNumber, callerName,
+                 callerDNID, accountCode, status))
+            return self.dbpool.runQuery("""
+                INSERT INTO `records`
+                    (uid, channel, caller_number, caller_name,
+                     caller_dnid, account_code, status, call_start)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""", (uid, channel,
+                    callerNumber, callerName, callerDNID, accountCode, status))
+
+        self.deferred.errback(ValueError("No UniqueID Set"))
+        return self.deferred
+
+    def queueRecord(self, uid):
+        """
+        Updates record into a queued status.
+        """
+        if uid > 0:
+            debug("Entering call into queue")
+            return self.dbpool.runQuery("""
+                UPDATE `records` SET
+                    hold_start = NOW(),
+                    status = 'ENQUEUE'
+                WHERE uid=%s""", (uid,))
+        self.deferred.errback(ValueError("No UniqueID Set"))
+        return self.deferred
+
+    def dequeueRecord(self, uid):
+        """
+        Updates record into a dequeued status. Closing out hold time and
+        setting dequeue status based on cause.
+        """
+        if uid > 0:
+            return self.dbpool.runQuery("""
+                UPDATE `records` SET
+                    hold_end = NOW(),
+                    status = CASE
+                        WHEN status = 'ABANDONED' THEN 'ABANDONED'
+                        WHEN status = 'TALKING' THEN 'TALKING'
+                        ELSE 'DEQUEUE'
+                    END
+                WHERE uid=%s""", (uid,))
+        self.deferred.errback(ValueError("No UniqueID Set"))
+        return self.deferred
+
+    def linkRecord(self, uid):
+        if uid > 0:
+            return self.dbpool.runQuery("""
+                UPDATE `records` SET
+                    talk_start = NOW(),
+                    status = 'TALKING'
+                WHERE uid=%s""", (uid,))
+        return self.deferred.errback(ValueError("No UniqueId Set"))
+
+    def unlinkRecord(self, uid):
+        if uid > 0:
+            return self.dbpool.runQuery("""
+                UPDATE `records` SET
+                    talk_end = NOW(),
+                    status = 'COMPLETE'
+                WHERE uid=%s""", (uid,))
+        return self.deferred.errback(ValueError("No UniqueId Set"))
+
+    def abandonRecord(self, uid):
+        if uid > 0:
+            return self.dbpool.runQuery("""
+                UPDATE `records` SET
+                    status = 'ABANDONED'
+                WHERE uid=%s""", (uid,))
+        return self.deferred.errback(ValueError("No UniqueId Set"))
+
+    def closeRecord(self, uid):
+        """
+        Closes a record in the stargate database
+        """
+        if uid > 0:
+            debug("Closing Call Record: ", uid)
+            return self.dbpool.runQuery("""
+                UPDATE `records` SET
+                    call_end = NOW(),
+                    hold_end = IF(
+                            hold_start != '0000-00-00 00:00:00'
+                            AND hold_end = '0000-00-00 00:00:00',
+                            NOW(), hold_end
+                        ),
+                    talk_end = IF(
+                            talk_start != '0000-00-00 00:00:00'
+                            AND talk_end = '0000-00-00 00:00:00',
+                            NOW(), talk_end
+                        )
+                WHERE uid = %s""", (uid,))
+        self.deferred.errback(ValueError("No UniqueID Set"))
+        return self.deferred
+
+
+class CallRecordPlugin:
+    """
+    Call data record plugin implementation to work with the stargate and
+    asterisk interface system. Collect and track call data records.
+    """
+    implements(IChevron, IPlugin)
+
+    def __init__(self):
+        self.application = None
+        self.service = None
+        self.factory = None
+        self.cfg = config.plugins['records']
+        self.active = []
+
+    def registerServices(self, application):
+        pass
+
+    def registerCommands(self, application):
+        debug("%s chevron commands locked" % (self.__class__.__name__,))
+        if self.application is None:
+            self.application = application
+        self.application.registerCommands('NewCall', self._createRecord)
+
+    def registerEvents(self, application):
+        debug("%s chevron events locked" % (self.__class__.__name__,))
+        if self.application is None:
+            self.application = application
+        self.application.ami.registerEvent('Hangup', self._onHangup)
+        self.application.ami.registerEvent('Join', self._onJoin)
+        self.application.ami.registerEvent('Leave', self._onLeave)
+        self.application.ami.registerEvent('Bridge', self._onBridge)
+        self.application.ami.registerEvent('Unlink', self._onUnlink)
+        self.application.ami.registerEvent('QueueCallerAbandon',
+            self._onAbandon)
+
+        # Initialize the new connection
+        h = RequestHandler(self.application.dbpool)
+        d = h.getActiveRecords().addErrback(self._fail)
+        s = self.application.ami.status()
+        dl = defer.gatherResults([d, s])
+        dl.addCallback(self._initRecords)
+
+    def _initRecords(self, args):
+        """
+        Initialize the records and active lists by comparing the open call
+        records in the database to those open channels from the phone system if
+        a call record exists in the db and in the channels then make the
+        channel actively monitored, else close out the record or ignore the
+        channel
+        """
+        records = args[0]
+        channels = args[1]
+
+        self.active = []
+
+        for record in records:
+            uid = record[0]
+            found = None
+            for channel in channels:
+                if channel['uniqueid'] == uid:
+                    self.active.append(uid)
+                    found = True
+                    break
+            if not found:
+                h = RequestHandler(self.application.dbpool)
+                d = h.closeRecord(uid).addErrback(self._fail)
+        debug("Active List: %s" % (self.active,))
+
+    def _fail(self, failure, agi=None):
+        """ Handles failures """
+        log.err(failure)
+
+        if agi is not None:
+            sequence = fastagi.InSequence()
+            sequence.append(agi.wait, 1)
+            sequence.append(agi.setPriority, 1)
+            sequence.append(agi.finish)
+            return sequence()
+
+    def _interesting(self, agi=None, event=None):
+        """
+        Decides whether this channel event is interesting.
+        Ideally it would be all incoming calls on the zap channel and
+        all incoming calls from the vonage lines. The point is to exclude
+        events triggered by internal channels and communication.
+        """
+        if agi is not None:
+            uid = agi.variables['agi_uniqueid']
+        elif event is not None:
+            uid = event['uniqueid']
+        else:
+            return False
+
+        return (uid in self.active)
+
+    def _createRecord(self, agi, status=None):
+        debug("%s Chevron: Create Record Command Triggered" %
+            (self.__class__.__name__))
+
+        if status is None:
+            status = agi.getVariable("CDRSTATUS")
+        else:
+            status = status[0]
+
+        ## Chained defers method
+        h = RequestHandler(self.application.dbpool)
+        d = h.createRecord(agi.variables['agi_uniqueid'],
+                           agi.variables['agi_channel'],
+                           agi.variables['agi_callerid'],
+                           agi.variables['agi_calleridname'],
+                           agi.variables['agi_dnid'],
+                           agi.variables['agi_accountcode'],
+                           status)
+        d.addErrback(self._fail, agi=agi)
+
+        self.active.append(agi.variables['agi_uniqueid'])
+
+        sequence = fastagi.InSequence()
+        sequence.append(agi.wait, 1)
+        sequence.append(agi.finish)
+        return sequence()
+
+    def _onJoin(self, ami, event):
+        """
+        Join queue event trigger, once triggered the call status and hold time
+        start tracking.
+        """
+        if not self._interesting(event=event):
+            return
+
+        debug("%s Chevron: %s Event Triggered: %s" %
+            (self.__class__.__name__, event['event'], event,))
+
+        h = RequestHandler(self.application.dbpool)
+        d = h.queueRecord(event['uniqueid'])
+        d.addErrback(self._fail)
+
+    def _onLeave(self, ami, event):
+        """
+        Leave queue event trigger, once triggered the call status and hold
+        times will reflect the change. from this point call is either hanging
+        up or entering talk state.
+        """
+        if not self._interesting(event=event):
+            return
+
+        debug("%s Chevron: %s Event Triggered: %s" %
+            (self.__class__.__name__, event['event'], event,))
+
+        h = RequestHandler(self.application.dbpool)
+        d = h.dequeueRecord(event['uniqueid'])
+        d.addErrback(self._fail)
+
+    def _onBridge(self, ami, event):
+        """
+        Bridge event triggered causing the calls channel to be linked to
+        another. This is an indication of an agent/phone talking with the
+        originating call's channel
+        """
+        if event['uniqueid1'] in self.active:
+            uid = event['uniqueid1']
+        elif event['uniqueid2'] in self.active:
+            uid = event['uniqueid2']
+        else:
+            return
+
+        debug("%s Chevron: %s Event Triggered: %s" %
+            (self.__class__.__name__, event['event'], event,))
+
+        if event['bridgestate'] == "Link":
+            h = RequestHandler(self.application.dbpool)
+            d = h.linkRecord(uid)
+            d.addErrback(self._fail)
+
+    def _onUnlink(self, ami, event):
+        """
+        Unlink event triggered causing the originating channel which had been
+        linked to disconnect. Either entering back into the phone IVR system or
+        directly handing up and finishing the call.
+        """
+        if event['uniqueid1'] in self.active:
+            uid = event['uniqueid1']
+        elif event['uniqueid2'] in self.active:
+            uid = event['uniqueid2']
+        else:
+            return
+
+        debug("%s Chevron: %s Event Triggered: %s" %
+            (self.__class__.__name__, event['event'], event,))
+
+        h = RequestHandler(self.application.dbpool)
+        d = h.unlinkRecord(uid)
+        d.addErrback(self._fail)
+
+    def _onAbandon(self, ami, event):
+        """
+        """
+        if not self._interesting(event=event):
+            return
+
+        debug("%s Chevron: %s Event Triggered: %s" %
+            (self.__class__.__name__, event['event'], event,))
+
+        h = RequestHandler(self.application.dbpool)
+        d = h.abandonRecord(event['uniqueid'])
+        d.addErrback(self._fail)
+
+    def _onHangup(self, ami, event):
+        """
+        Hangup event triggered causes the call record to close out adding
+        required end times and final status of call.
+        """
+        if not self._interesting(event=event):
+            return
+
+        debug("%s Chevron: %s Event Triggered: %s" %
+            (self.__class__.__name__, event['event'], event,))
+
+        h = RequestHandler(self.application.dbpool)
+        d = h.closeRecord(event['uniqueid'])
+        d.addErrback(self._fail)
+
+        del self.active[event['uniqueid']]
+        debug("Active calls: %d" % (len(self.active),))
+
+# Comment out this line to disable the plugin
+callRecordPlugin = CallRecordPlugin()

@@ -1,0 +1,35 @@
+.:PREREQUISITS:.
+
+Install the following python libraries
+    * python 2.6
+    * twisted
+    * mysql-python
+    * basicproperty
+    * starpy
+
+.:INSTALLATION:.
+
+Setup an environment (virtualenv preferred), then install each of the prereqs
+
+    % virtualenv --no-site-packages /usr/local/stargate/env
+    % cd /usr/local/stargate/env
+    % source bin/activate
+    % pip install twisted
+    % pip install mysql-python
+    % mkdir /usr/local/stargate/env/src
+
+Download basicproperty from http://basicproperty.sourceforge.net/
+
+    % wget "http://basicproperty.sourceforge.net/.../basicproperty.tar.gz" -O \
+      /usr/local/stargate/env/src/
+    % cd /usr/local/stargate/env/src/
+    % tar -xzf basicproperty*.tar.gz && cd basicproperty*
+    % pip install .
+
+Download starpy from http://starpy.sourceforge.net/
+
+    % wget "http://starpy.sourceforge.net/.../starpy.tar.gz" -O \
+      /usr/local/stargate/env/src/
+    % cd /usr/local/stargate/env/src/
+    % tar -xzf starpy*.tar.gz && cd starpy*
+    % pip install .
